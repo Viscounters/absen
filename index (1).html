@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Absensi</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  /* Warna mengikuti tema Telegram (otomatis terang/gelap), dengan fallback */
+  :root {
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --text: var(--tg-theme-text-color, #000000);
+    --hint: var(--tg-theme-hint-color, #707579);
+    --btn: var(--tg-theme-button-color, #2481cc);
+    --btn-text: var(--tg-theme-button-text-color, #ffffff);
+    --card: var(--tg-theme-secondary-bg-color, #f1f1f1);
+    --ok: #2e9e4f;
+    --err: #d33a3a;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 16px;
+    line-height: 1.45;
+    min-height: 100vh;
+    padding: 20px 16px 32px;
+  }
+  .wrap { max-width: 480px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 4px 0 4px; }
+  .sub { color: var(--hint); margin: 0 0 20px; font-size: 14px; }
+  .card { background: var(--card); border-radius: 14px; padding: 16px; margin-bottom: 16px; }
+  .status { display: flex; align-items: flex-start; gap: 12px; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--hint); margin-top: 6px; flex-shrink: 0; }
+  .dot.loading { animation: pulse 1s infinite ease-in-out; }
+  .dot.ok { background: var(--ok); }
+  .dot.err { background: var(--err); }
+  @keyframes pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+  .status-title { font-weight: 600; }
+  .status-detail { color: var(--hint); font-size: 14px; margin-top: 4px; white-space: pre-line; }
+  button {
+    width: 100%; border: 0; border-radius: 12px; padding: 14px 16px;
+    font-size: 16px; font-weight: 600; background: var(--btn); color: var(--btn-text);
+    cursor: pointer; margin-top: 10px;
+  }
+  button.secondary { background: var(--card); color: var(--text); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:active:not(:disabled) { transform: scale(.98); }
+  .hidden { display: none !important; }
+  .row { margin-bottom: 14px; }
+  .label { color: var(--hint); font-size: 13px; margin-bottom: 4px; }
+  .value { font-weight: 600; word-break: break-all; }
+  .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .warn { color: var(--err); font-size: 14px; margin-top: 12px; white-space: pre-line; }
+  .foot { color: var(--hint); font-size: 11px; text-align: center; margin-top: 24px; opacity: .8; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ===== Layar 1: lokasi + scan ===== -->
+  <section id="screen-main">
+    <h1>Absensi</h1>
+    <p class="sub">Aktifkan lokasi, lalu scan QR absen.</p>
+
+    <div class="card">
+      <div class="status">
+        <div id="dot" class="dot loading"></div>
+        <div>
+          <div id="status-title" class="status-title">Mengambil lokasi...</div>
+          <div id="status-detail" class="status-detail"></div>
+        </div>
+      </div>
+    </div>
+
+    <button id="btn-retry" class="secondary hidden">Coba lagi</button>
+    <button id="btn-scan" disabled>Scan QR</button>
+  </section>
+
+  <!-- ===== Layar 2: konfirmasi ===== -->
+  <section id="screen-confirm" class="hidden">
+    <h1>Konfirmasi Absen</h1>
+    <p class="sub">Periksa data sebelum dikirim.</p>
+
+    <div class="card">
+      <div class="row">
+        <div class="label">Kode QR</div>
+        <div id="c-kode" class="value mono"></div>
+      </div>
+      <div class="row">
+        <div class="label">Koordinat</div>
+        <div id="c-koor" class="value mono"></div>
+      </div>
+      <div class="row" style="margin-bottom:0">
+        <div class="label">Akurasi lokasi</div>
+        <div id="c-akurasi" class="value"></div>
+      </div>
+    </div>
+
+    <div id="send-warn" class="warn hidden"></div>
+    <button id="btn-send">Kirim Absen</button>
+    <button id="btn-rescan" class="secondary">Scan Ulang</button>
+  </section>
+
+  <!-- Info versi & platform (membantu cek apakah file terbaru sudah termuat) -->
+  <div id="foot" class="foot"></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var VERSI = "v2";
+  var tg = window.Telegram && window.Telegram.WebApp;
+  var $ = function (id) { return document.getElementById(id); };
+
+  var dot = $("dot"), title = $("status-title"), detail = $("status-detail");
+  var btnScan = $("btn-scan"), btnRetry = $("btn-retry");
+  var btnSend = $("btn-send"), btnRescan = $("btn-rescan");
+  var screenMain = $("screen-main"), screenConfirm = $("screen-confirm");
+  var sendWarn = $("send-warn");
+
+  var posisi = null;   // { lat, lon, akurasi }
+  var kodeQR = null;
+
+  function setStatus(type, t, d) {
+    dot.className = "dot " + type; // loading | ok | err
+    title.textContent = t;
+    detail.textContent = d || "";
+  }
+  function tampilLayar(nama) {
+    screenMain.classList.toggle("hidden", nama !== "main");
+    screenConfirm.classList.toggle("hidden", nama !== "confirm");
+  }
+
+  // ---- Info debug kecil di bawah halaman ----
+  $("foot").textContent = "Absensi " + VERSI +
+    " • " + (tg ? (tg.platform || "?") + " " + (tg.version || "") : "tanpa Telegram");
+
+  // ---- Inisialisasi Telegram ----
+  if (tg) {
+    try { tg.ready(); tg.expand(); } catch (e) {}
+  }
+
+  // Deteksi "dibuka di Telegram". initData bisa kosong di sebagian kasus
+  // (mis. tombol keyboard / klien tertentu), jadi cek juga platform & parameter URL.
+  var diTelegram = !!(tg && (
+    tg.initData ||
+    (tg.platform && tg.platform !== "unknown") ||
+    /tgWebApp(Data|Version|Platform)=/.test(location.hash + location.search)
+  ));
+
+  if (!diTelegram) {
+    setStatus("err", "Buka halaman ini lewat bot Telegram",
+      "Halaman ini hanya berfungsi sebagai Mini App di dalam Telegram.");
+    btnScan.disabled = true;
+    return;
+  }
+
+  // ---- Lokasi ----
+  function ambilLokasi() {
+    posisi = null;
+    btnScan.disabled = true;
+    btnRetry.classList.add("hidden");
+    setStatus("loading", "Mengambil lokasi...", "");
+
+    if (!navigator.geolocation) {
+      setStatus("err", "Lokasi tidak tersedia",
+        "Perangkat atau aplikasi ini tidak mendukung layanan lokasi.");
+      btnRetry.classList.remove("hidden");
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      function (pos) {
+        posisi = {
+          lat: pos.coords.latitude,
+          lon: pos.coords.longitude,
+          akurasi: Math.round(pos.coords.accuracy)
+        };
+        setStatus("ok", "Lokasi didapat (akurasi ±" + posisi.akurasi + " m)",
+          posisi.lat.toFixed(6) + ", " + posisi.lon.toFixed(6));
+        btnScan.disabled = false;
+      },
+      function (err) {
+        if (err.code === 1) { // izin ditolak
+          setStatus("err", "Izin lokasi ditolak",
+            "Aktifkan izin lokasi:\n" +
+            "1. Buka Pengaturan HP > Aplikasi > Telegram > Izin > Lokasi, pilih \"Izinkan saat aplikasi digunakan\".\n" +
+            "2. Pastikan GPS/Lokasi di HP menyala.\n" +
+            "3. Kembali ke sini lalu tekan \"Coba lagi\".");
+        } else if (err.code === 3) { // timeout
+          setStatus("err", "Waktu pengambilan lokasi habis",
+            "Sinyal GPS lemah. Pindah ke tempat terbuka lalu coba lagi.");
+        } else { // tidak tersedia
+          setStatus("err", "Lokasi tidak tersedia",
+            "Pastikan GPS menyala dan koneksi internet stabil, lalu coba lagi.");
+        }
+        btnRetry.classList.remove("hidden");
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+    );
+  }
+
+  // ---- Scan QR ----
+  function mulaiScan() {
+    if (!posisi) return;
+
+    // showScanQrPopup butuh Bot API 6.4+
+    var versiLama = (typeof tg.isVersionAtLeast === "function") && !tg.isVersionAtLeast("6.4");
+    if (typeof tg.showScanQrPopup !== "function" || versiLama) {
+      setStatus("err", "Fitur scan QR tidak tersedia",
+        "Perbarui aplikasi Telegram Anda ke versi terbaru, lalu buka lagi halaman ini.");
+      btnScan.disabled = true;
+      return;
+    }
+
+    try {
+      tg.showScanQrPopup({ text: "Arahkan kamera ke QR absen" }, function (teks) {
+        if (!teks) return;          // kosong: lanjut memindai
+        kodeQR = String(teks);
+        tampilKonfirmasi();
+        return true;                // true = tutup popup
+      });
+    } catch (e) {
+      setStatus("err", "Scan QR gagal dibuka",
+        "Perbarui Telegram ke versi terbaru dan pastikan izin kamera aktif.\n(" + (e && e.message ? e.message : e) + ")");
+    }
+  }
+
+  // ---- Konfirmasi & kirim ----
+  function tampilKonfirmasi() {
+    $("c-kode").textContent = kodeQR;
+    $("c-koor").textContent = posisi.lat.toFixed(6) + ", " + posisi.lon.toFixed(6);
+    $("c-akurasi").textContent = "±" + posisi.akurasi + " m";
+    sendWarn.classList.add("hidden");
+    btnSend.disabled = false;
+    tampilLayar("confirm");
+  }
+
+  function kirimAbsen() {
+    if (!kodeQR || !posisi) return;
+    btnSend.disabled = true;
+    // Format persis sesuai kebutuhan bot
+    var payload = JSON.stringify({ kode: kodeQR, lat: posisi.lat, lon: posisi.lon });
+    try {
+      tg.sendData(payload); // Mini App tertutup otomatis jika berhasil
+    } catch (e) {
+      sendWarn.textContent = "Gagal mengirim: " + (e && e.message ? e.message : e);
+      sendWarn.classList.remove("hidden");
+      btnSend.disabled = false;
+      return;
+    }
+    // Jika masih terbuka setelah 2 detik, kemungkinan bukan dibuka dari tombol keyboard
+    setTimeout(function () {
+      sendWarn.textContent =
+        "Data belum terkirim. Pastikan Mini App dibuka lewat tombol keyboard di chat bot " +
+        "(bukan tombol menu, link, atau tombol inline), lalu coba lagi.";
+      sendWarn.classList.remove("hidden");
+      btnSend.disabled = false;
+    }, 2000);
+  }
+
+  function scanUlang() {
+    kodeQR = null;
+    tampilLayar("main");
+    mulaiScan();
+  }
+
+  btnRetry.addEventListener("click", ambilLokasi);
+  btnScan.addEventListener("click", mulaiScan);
+  btnSend.addEventListener("click", kirimAbsen);
+  btnRescan.addEventListener("click", scanUlang);
+
+  // Langsung minta lokasi saat halaman dimuat
+  ambilLokasi();
+})();
+</script>
+</body>
+</html>
